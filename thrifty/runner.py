@@ -48,9 +48,11 @@ class BudgetRunner:
     difficulty_fn : ``list[str] -> nu`` (self-consistency by default) OR, if
         ``difficulty_of_prompt`` is given, that ``prompt -> nu`` callable is used
         instead (e.g. a learned predictor or an oracle) and no probe is drawn.
-    verifier : optional ``answer -> bool`` checker. If given, answers are
-        aggregated by best-of-n (pass@b, the metric the index allocator
-        optimises); if ``None``, by majority vote.
+    verifier : optional ``answer -> bool`` checker, or a prompt-aware
+        ``(prompt, answer) -> bool`` (auto-detected by arity) for tasks where
+        correctness depends on the query, e.g. math with per-problem gold. If
+        given, answers are aggregated by best-of-n (pass@b, the metric the
+        index allocator optimises); if ``None``, by majority vote.
     """
 
     def __init__(
@@ -61,6 +63,7 @@ class BudgetRunner:
         difficulty_fn: Callable[[Sequence[str]], float] = self_consistency_hazard,
         difficulty_of_prompt: Callable[[str], float] | None = None,
         verifier: Callable[[str], bool] | None = None,
+        max_per: int | None = None,
     ) -> None:
         if strategy not in ("index", "uniform"):
             raise ValueError(f"unknown strategy: {strategy!r}")
@@ -70,10 +73,29 @@ class BudgetRunner:
         self.difficulty_fn = difficulty_fn
         self.difficulty_of_prompt = difficulty_of_prompt
         self.verifier = verifier
+        self.max_per = max_per
+        self._verifier_takes_prompt = False
+        if verifier is not None:
+            import inspect
 
-    def _aggregate(self, answers: Sequence[str]) -> str | None:
-        if self.verifier is not None:
-            return best_of_n(answers, self.verifier)
+            try:
+                params = inspect.signature(verifier).parameters
+                self._verifier_takes_prompt = len(params) >= 2
+            except (TypeError, ValueError):
+                pass
+
+    def _bound_verifier(self, prompt: str) -> Callable[[str], bool] | None:
+        """The verifier as a one-arg ``answer -> bool`` for this prompt."""
+        if self.verifier is None:
+            return None
+        if self._verifier_takes_prompt:
+            return lambda a, _p=prompt: self.verifier(_p, a)
+        return self.verifier
+
+    def _aggregate(self, prompt: str, answers: Sequence[str]) -> str | None:
+        v = self._bound_verifier(prompt)
+        if v is not None:
+            return best_of_n(answers, v)
         return majority_vote(answers)
 
     def run(self, prompts: Sequence[str], budget: float) -> BatchResult:
@@ -84,7 +106,7 @@ class BudgetRunner:
     def _run_uniform(self, prompts: Sequence[str], budget: float) -> BatchResult:
         alloc = uniform_allocate(len(prompts), budget)
         results = [
-            QueryResult(p, self._aggregate(self.backend.sample(p, b)), b)
+            QueryResult(p, self._aggregate(p, self.backend.sample(p, b)), b)
             for p, b in zip(prompts, alloc)
         ]
         return BatchResult(results)
@@ -94,9 +116,9 @@ class BudgetRunner:
         if self.difficulty_of_prompt is not None:
             # difficulty known without probing (learned predictor / oracle)
             nus = [self.difficulty_of_prompt(p) for p in prompts]
-            alloc = index_allocate(nus, budget, min_per=0)
+            alloc = index_allocate(nus, budget, min_per=0, max_per=self.max_per)
             results = [
-                QueryResult(p, self._aggregate(self.backend.sample(p, b)), b)
+                QueryResult(p, self._aggregate(p, self.backend.sample(p, b)), b)
                 for p, b in zip(prompts, alloc)
             ]
             return BatchResult(results)
@@ -107,10 +129,13 @@ class BudgetRunner:
         probe = min(self.probe, max(1, int(round(budget))))
         probe_answers = [self.backend.sample(p, probe) for p in prompts]
         if self.verifier is not None:
-            nus = [pass_rate_hazard(a, self.verifier) for a in probe_answers]
+            nus = [
+                pass_rate_hazard(a, self._bound_verifier(p))
+                for p, a in zip(prompts, probe_answers)
+            ]
         else:
             nus = [self.difficulty_fn(a) for a in probe_answers]
-        alloc = index_allocate(nus, budget, min_per=probe)
+        alloc = index_allocate(nus, budget, min_per=probe, max_per=self.max_per)
 
         results = []
         for p, pa, b in zip(prompts, probe_answers, alloc):
@@ -118,13 +143,24 @@ class BudgetRunner:
             answers = list(pa)
             if extra > 0:
                 answers.extend(self.backend.sample(p, extra))
-            results.append(QueryResult(p, self._aggregate(answers), b))
+            results.append(QueryResult(p, self._aggregate(p, answers), b))
         return BatchResult(results)
 
 
-def accuracy(result: BatchResult, gold: dict[str, str]) -> float:
-    """Fraction of queries whose aggregated answer matches the gold answer."""
+def accuracy(
+    result: BatchResult,
+    gold: dict[str, str],
+    equal: Callable[[str, str], bool] | None = None,
+) -> float:
+    """Fraction of queries whose aggregated answer matches the gold answer.
+
+    ``equal(pred, gold) -> bool`` overrides exact string match (e.g.
+    :func:`thrifty.mathv.math_equal` for numeric equivalence).
+    """
     if not result.results:
         return 0.0
-    correct = sum(r.answer == gold[r.prompt] for r in result.results)
+    eq = equal or (lambda a, g: a == g)
+    correct = sum(
+        r.answer is not None and eq(r.answer, gold[r.prompt]) for r in result.results
+    )
     return correct / len(result.results)

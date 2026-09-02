@@ -16,9 +16,10 @@ from .core import index_allocate, success_prob, uniform_allocate
 from .cost import CountingBackend, Usage, estimate_tokens
 from .difficulty import OracleHazard, self_consistency_hazard
 from .frontier import Config, Knee, epsilon_front, knee, pareto_front, to_rows
+from .mathv import extract_answer, math_equal
 from .runner import BatchResult, BudgetRunner, QueryResult, accuracy
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "BudgetRunner",
@@ -44,4 +45,7 @@ __all__ = [
     "CountingBackend",
     "Usage",
     "estimate_tokens",
+    # math answer verification (real-benchmark helpers)
+    "extract_answer",
+    "math_equal",
 ]

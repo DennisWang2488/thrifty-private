@@ -9,7 +9,10 @@ tutorials, and reproducing the savings curve without spending a cent.
 from __future__ import annotations
 
 import random
+import threading
+import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import Sequence
 
 
@@ -63,6 +66,12 @@ class OpenAIBackend(LLMBackend):
     the comparable final answer (default: last non-empty line). Works against any
     OpenAI-compatible server, including a local vLLM/SGLang endpoint, by setting
     ``base_url``.
+
+    Some servers (DeepSeek among them) reject ``n > 1``; set ``n_per_request=1``
+    (or leave the default auto-detect) and the backend draws the ``n`` samples as
+    concurrent single-sample requests instead. Cumulative token usage is tracked
+    in ``prompt_tokens`` / ``completion_tokens`` so cost can be accounted in
+    tokens, not just sample counts.
     """
 
     def __init__(
@@ -74,6 +83,9 @@ class OpenAIBackend(LLMBackend):
         max_tokens: int = 1024,
         extract_fn=None,
         system_prompt: str | None = None,
+        n_per_request: int | None = None,
+        max_concurrency: int = 8,
+        max_retries: int = 3,
     ) -> None:
         try:
             from openai import OpenAI
@@ -85,43 +97,91 @@ class OpenAIBackend(LLMBackend):
         self.max_tokens = max_tokens
         self.extract_fn = extract_fn or _last_line
         self.system_prompt = system_prompt
+        self.n_per_request = n_per_request  # None = auto-detect batched-n support
+        self.max_concurrency = max_concurrency
+        self.max_retries = max_retries
         self.calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
         self.last_usage = None
-        """Server-reported token usage for the most recent call, or ``None`` if
-        the server reported none. :class:`~thrifty.cost.CountingBackend` reads
-        this and falls back to estimating when it is ``None``."""
+        """Server-reported token usage for the most recent :meth:`sample` call,
+        aggregated over its requests, or ``None`` if the server reported none.
+        :class:`~thrifty.cost.CountingBackend` reads this and falls back to
+        estimating when it is ``None``."""
+        self._usage_lock = threading.Lock()
 
-    def sample(self, prompt: str, n: int) -> list[str]:
-        if n <= 0:
-            return []
+    def _messages(self, prompt: str) -> list[dict]:
         messages = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         messages.append({"role": "user", "content": prompt})
-        # Most servers support n>1 in one request; fall back to a loop if not.
-        resp = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            n=n,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-        )
-        self.calls += n
+        return messages
+
+    def _request(self, prompt: str, n: int) -> tuple[list[str], int, int]:
+        """One request for ``n`` samples; returns (answers, prompt_tok, compl_tok)."""
+        last_err: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=self._messages(prompt),
+                    n=n,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                u = getattr(resp, "usage", None)
+                p_tok = (getattr(u, "prompt_tokens", 0) or 0) if u is not None else 0
+                c_tok = (getattr(u, "completion_tokens", 0) or 0) if u is not None else 0
+                with self._usage_lock:
+                    self.prompt_tokens += p_tok
+                    self.completion_tokens += c_tok
+                    self.calls += n
+                answers = [self.extract_fn(c.message.content or "") for c in resp.choices]
+                return answers, p_tok, c_tok
+            except Exception as e:  # transient server/network errors
+                last_err = e
+                time.sleep(2**attempt)
+        raise last_err  # type: ignore[misc]
+
+    def _finish(self, n: int, p_tok: int, c_tok: int) -> None:
         # Imported here rather than at module scope: cost.py wraps backends, so
         # a top-level import would be circular.
         from .cost import Usage
 
-        u = getattr(resp, "usage", None)
         self.last_usage = (
-            Usage(
-                samples=n,
-                prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(u, "completion_tokens", 0) or 0,
-            )
-            if u is not None
+            Usage(samples=n, prompt_tokens=p_tok, completion_tokens=c_tok)
+            if (p_tok or c_tok)
             else None
         )
-        return [self.extract_fn(c.message.content or "") for c in resp.choices]
+
+    def sample(self, prompt: str, n: int) -> list[str]:
+        if n <= 0:
+            return []
+        if self.n_per_request is None:
+            # auto-detect: try one batched-n request, fall back to a loop.
+            if n == 1:
+                answers, p, c = self._request(prompt, 1)
+                self._finish(n, p, c)
+                return answers
+            try:
+                answers, p, c = self._request(prompt, n)
+                self.n_per_request = n  # remember that batching works
+                self._finish(n, p, c)
+                return answers
+            except Exception:
+                self.n_per_request = 1
+        if self.n_per_request >= n:
+            answers, p, c = self._request(prompt, n)
+            self._finish(n, p, c)
+            return answers
+        # concurrent requests, each for at most ``n_per_request`` samples
+        per = max(1, self.n_per_request)
+        chunks = [per] * (n // per) + ([n % per] if n % per else [])
+        with ThreadPoolExecutor(max_workers=self.max_concurrency) as ex:
+            parts = list(ex.map(lambda k: self._request(prompt, k), chunks))
+        answers = [a for part in parts for a in part[0]]
+        self._finish(n, sum(p[1] for p in parts), sum(p[2] for p in parts))
+        return answers
 
 
 def _last_line(text: str) -> str:

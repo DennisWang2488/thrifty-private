@@ -5,3 +5,10 @@ __pycache__/
 .venv/
 build/
 dist/
+
+# local API keys — never commit
+*api*key*.txt
+.env
+
+# re-downloadable dataset (the sample cache IS committed, on purpose)
+examples/data/math500.jsonl

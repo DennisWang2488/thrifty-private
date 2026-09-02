@@ -5,8 +5,11 @@ with fewer samples by spending your sampling budget where it buys the most:
 hard-but-doable queries get more samples, trivial and hopeless ones get fewer.
 Backend-agnostic — any OpenAI-compatible API or a local vLLM/SGLang server.
 
-> Status: v0.1, working name. Targets **verifiable** tasks (code, math, anything
-> with a checker or reward model) where the metric is best-of-n / pass@b.
+> **Status: v0.2 — validated on a real API, now frozen.** Targets **verifiable**
+> tasks (code, math, anything with a checker or reward model) where the metric is
+> best-of-n / pass@b. On DeepSeek V3 / MATH-500 it saves ~33% of samples at
+> matched accuracy; see [Results](#does-it-actually-save-real-model-deepseek-v3-on-math-500)
+> and [Project status](#project-status).
 
 ## Why
 
@@ -50,29 +53,51 @@ from thrifty import BudgetRunner, OpenAIBackend
 
 backend = OpenAIBackend(model="gpt-4o-mini")          # or base_url=local vLLM
 runner = BudgetRunner(
-    backend, strategy="index", probe=4,
+    backend, strategy="index", probe=2,
     verifier=my_checker,        # e.g. runs unit tests / checks the boxed answer
 )
 result = runner.run(prompts, budget=8.0)
 ```
 
-`strategy="uniform"` gives the best-of-n baseline for comparison.
+`strategy="uniform"` gives the best-of-n baseline for comparison. The verifier
+may also be prompt-aware — `(prompt, answer) -> bool`, detected by arity — which
+is what per-problem gold answers need. Servers that reject `n > 1` (DeepSeek,
+for one) are handled by `OpenAIBackend(..., n_per_request=1)`, which draws the
+samples as concurrent single-sample requests; `prompt_tokens` /
+`completion_tokens` accumulate real usage for token-denominated cost accounting.
 
-## Does it actually save? (offline benchmark)
+## Does it actually save? (real model: DeepSeek V3 on MATH-500)
 
-`examples/demo_mock.py`, 300 synthetic queries (a realistic difficulty spread
-with a hard floor and an easy bulk), best-of-n with a verifier, 12 reps:
+134 level-5 problems, `deepseek-chat`, best-of-n with a boxed-answer verifier,
+5 reps (mean ± sd). Reproduce with
+[`examples/bench_deepseek.py`](examples/bench_deepseek.py) and
+[`examples/sweep_reps.py`](examples/sweep_reps.py); total API cost was ≈ $1, and
+the raw generations are committed under `examples/data/cache/` so the tables can
+be re-derived with no API key at all. Full write-up: [`RESULTS.md`](RESULTS.md).
 
-| target accuracy | uniform | index (probe signal) | index (oracle signal) |
-|---|---|---|---|
-| ≥ 0.88 | ~3600 samples | **~2400 (−33%)** | ~1800 (−50%) |
-| ≥ 0.93 | not reached @ 4800 | **~2400** | ~2400 |
+![accuracy vs budget](examples/data/sweep_plot.png)
 
-The `probe` signal is free — it reuses the probe samples in the final answer and,
-with a verifier, estimates difficulty from the *unbiased* probe pass rate. At a
-high quality bar it nearly matches a perfect difficulty oracle. At a low quality
-bar (≤ 0.80) the probe's fixed cost isn't amortised and it degrades to uniform —
-that regime is where a cheaper/learned difficulty signal (v0.2) earns its keep.
+| budget (avg samples/query) | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|
+| uniform | .684±.011 | .710±.012 | .725±.006 | .731±.005 | .740±.003 |
+| index (probe=2) | .684±.011 | .696±.011 | **.737±.003** | **.745±.006** | .745±.006 |
+| index (oracle μ) | .742±.004 | .742±.004 | .742±.004 | .746±.005 | .749±.004 |
+
+Two headlines:
+
+- **The free probe signal saves ~33% of samples.** Index at budget 4 (.737)
+  matches uniform at budget 6 (.740). The probe is free because its samples are
+  reused in the final answer, and with a verifier it estimates difficulty from
+  the *unbiased* probe pass rate.
+- **A perfect difficulty signal would save 3×.** Oracle-μ allocation reaches
+  uniform's budget-6 accuracy at budget 2. The allocator is not the bottleneck —
+  the difficulty signal is. That gap is the case for a learned predictor.
+
+Below budget 4 the probe's fixed cost isn't amortised and index degrades to (or
+slightly below) uniform; with `probe=4` and budget ≤ 4 the probe consumes the
+entire budget and index equals uniform *by construction*. Small probes win when
+budgets are small. `examples/demo_mock.py` reproduces the same qualitative
+picture offline, for free.
 
 ## How it works (one paragraph)
 
@@ -84,19 +109,81 @@ integer version is greedy on marginal gain (`core.index_allocate`). The same
 shadow-price re-clearing is what makes the rule robust to difficulty-estimate
 noise.
 
-## Roadmap
+## Reproducing the benchmark
 
-- **v0.2** learned difficulty predictor trained decision-focused (LANCER-style),
-  for the low-budget regime and non-verifiable tasks.
-- **v0.2** majority-vote production function (no verifier) — a different
-  allocation law (`1 − (1−μ)^b` is the wrong objective there).
-- **v0.3** model routing (cheap/expensive) as part of the allocation.
-- **v0.4** sequential early-stopping within a reasoning trace.
-- **v0.5** first-class local vLLM/SGLang integration + token-budget (not just
-  sample-count) allocation.
+```bash
+pip install -e ".[openai,dev]"
+export DEEPSEEK_API_KEY=sk-...          # or DEEPSEEK_KEY_FILE=/path/to/key.txt
 
-## Limitations (v0.1)
+python examples/bench_deepseek.py --download-only        # fetch MATH-500
+python examples/bench_deepseek.py --dry-run --n 40       # cost estimate, no spend
+python examples/bench_deepseek.py --pilot --n 40 --levels 5   # difficulty histogram
+python examples/bench_deepseek.py --n 134 --levels 5 --budget 6
+python examples/sweep_reps.py                            # error bars + plot
+```
+
+Pilot first. The savings depend entirely on there being a difficulty spread: if
+the model solves nearly everything on the first sample, there is nothing to
+allocate. DeepSeek V3 on mixed MATH level 4–5 solves ~75% at one sample (useless
+for this purpose); level 5 alone gives a usable spread. `--pilot` prints the
+estimated μ histogram so you can check before spending.
+
+## Limitations
 
 Verifiable tasks only (needs a `verifier`); allocates sample count, not thinking
 tokens; the self-consistency difficulty signal is a coarse fallback when no
 verifier is available; savings depend on the difficulty spread and quality bar.
+Verifier quality is load-bearing in a way that is easy to underestimate — the
+difficulty estimate inherits every verifier false negative, so a normalisation
+bug makes the allocator abandon solvable queries. Three such bugs (`x=5` vs `5`,
+unordered solution lists, `\sqrt2` vs `\sqrt{2}`) turned up in this benchmark's
+own verifier; `thrifty/mathv.py` is a pragmatic stdlib checker, and
+paper-grade grading should swap in something like `math_verify`.
+
+## Roadmap (not being pursued — see Project status)
+
+- **v0.3** learned difficulty predictor trained decision-focused (LANCER-style),
+  for the low-budget regime and non-verifiable tasks — the 3× oracle gap.
+- **v0.3** majority-vote production function (no verifier) — a different
+  allocation law (`1 − (1−μ)^b` is the wrong objective there).
+- **v0.4** model routing (cheap/expensive) as part of the allocation;
+  token-denominated rather than sample-count budgets.
+- **v0.5** sequential early-stopping within a reasoning trace; first-class local
+  vLLM/SGLang integration.
+
+## Related work (as of 2026)
+
+Difficulty-aware allocation of test-time compute is an active research area.
+This library's contribution is a clean, pip-installable, backend-agnostic
+implementation with a closed-form allocation rule and a robustness analysis —
+not algorithmic novelty. Closest neighbours: batch allocation via training-free
+difficulty proxies ([OpenReview](https://openreview.net/forum?id=ztGHhyicWs))
+and Difficulty-Adaptive Self-Consistency
+([arXiv:2408.13457](https://arxiv.org/abs/2408.13457)); sample-count-aware model
+routing ([BEST-Route](https://arxiv.org/abs/2506.22716)); allocation under
+costly verification ([AGRV](https://arxiv.org/abs/2605.17609)); per-query
+token-level early stopping ([Dynasor/Certaindex](https://github.com/hao-ai-lab/Dynasor));
+per-question sequential stopping
+([AdaptiveConsistency](https://github.com/Pranjal2041/AdaptiveConsistency)); the
+compute-optimal scaling framework
+([arXiv:2408.03314](https://arxiv.org/abs/2408.03314)) and pass@k scaling laws
+([arXiv:2407.21787](https://arxiv.org/abs/2407.21787)). The same allocation
+question appears on the RL-training side as rollout allocation across prompts:
+[Pilot-Commit](https://arxiv.org/abs/2605.26606), DAPO's dynamic sampling, and
+successors. Frontier labs are meanwhile moving per-query *token* allocation
+inside the model via effort-based reasoning controls, which narrows the
+external-allocator niche to verifier-based best-of-n, batch evaluation, and
+orchestration — exactly what this library targets.
+
+## Project status
+
+**Frozen (September 2026), and deliberately so.** The library works, is tested
+in CI, and the results above are real and reproducible. But a 2026 literature
+scan (above) found the batch-allocation idea already published, the RL-side
+analogue already done, and labs absorbing token allocation into the models
+themselves. The findings here independently reproduce the field's consensus —
+concentrate on middle difficulty, ~3× headroom for a better difficulty signal,
+a probe-amortisation boundary at low budgets — which makes this a good artifact
+and a poor research bet. Extending it further would be motivated reasoning, so
+the roadmap above stays unbuilt. Issues and forks welcome if it is useful to
+you.
