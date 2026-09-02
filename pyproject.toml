@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thrifty"
+version = "0.1.0"
+description = "Budget-aware test-time compute allocation for LLMs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["llm", "test-time-compute", "best-of-n", "inference", "allocation"]
+dependencies = []  # core is stdlib-only
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["thrifty*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
