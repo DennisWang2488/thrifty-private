@@ -22,10 +22,15 @@ serving order in `CachedBackend`), `sweep_reps.py`; plot at
 \* identical by construction: at budget 2 the 2-sample probe consumes the
 whole budget, so index = uniform.
 
-**Headline (with error bars):** index at budget 4 (.737) ≈ uniform at budget 6
-(.740) → **~33% fewer samples from the free probe signal**; oracle at budget 2
-(.742) ≈ uniform at budget 6 → **~3× headroom for a learned difficulty
-signal**.
+> **Corrected 2026-11.** The table above and the headline below were produced
+> with a replay bug; see [Replay correction](#replay-correction) for the
+> corrected table. The ~33% saving survives; the "~3×" oracle headroom was an
+> in-sample estimate and is ~2.5× held-out.
+
+**Headline (with error bars, original replay):** index at budget 4 (.737) ≈
+uniform at budget 6 (.740) → **~33% fewer samples from the free probe signal**;
+oracle at budget 2 (.742) ≈ uniform at budget 6 → **~3× headroom for a learned
+difficulty signal** (in-sample; see correction).
 
 ### Single-run exploratory sweep (superseded by the table above)
 
@@ -41,13 +46,55 @@ signal**.
 allocation is uniform *by construction* — the README's "probe cost isn't
 amortised at low budget" limitation, observed in the wild.
 
+## Replay correction
+
+`CachedBackend.sample(prompt, n)` used to return the first `n` cached samples on
+every call. `strategy="index"` calls it twice per prompt (probe, then top-up), so
+the top-up re-served the probe samples: a problem charged `probe + extra`
+samples saw only `max(probe, extra)` distinct ones. `uniform` and the oracle call
+it once per problem and were unaffected; `index(probe=2)` was handicapped, and
+the original index rows above were produced under this bug. `CachedBackend` now
+serves from a per-prompt cursor (distinct samples within a run; call `reset()`
+between runs), with regression tests in `tests/test_cached_backend.py`.
+
+Same protocol as above (5 reps, per-rep shuffle, `max_per=10`, 134 level-5
+problems, no API calls, zero short reads). Mean ± sd:
+
+| budget | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|
+| uniform, published | .684±.011 | .710±.012 | .725±.006 | .731±.005 | .740±.003 |
+| uniform, corrected | .682±.014 | .710±.012 | .725±.006 | .731±.005 | .742±.004 |
+| index probe=2, published | .684±.011 | .696±.011 | .737±.003 | .745±.006 | .745±.006 |
+| index probe=2, buggy replay (local) | .682±.014 | .691±.015 | .737±.003 | .746±.007 | .746±.007 |
+| index probe=2, corrected | .682±.014 | **.725±.006** | **.743±.004** | .749±.004 | .749±.004 |
+| oracle μ, published | .742±.004 | .742±.004 | .742±.004 | .746±.005 | .749±.004 |
+| oracle μ, corrected | .749±.004 | .749±.004 | .749±.004 | .749±.004 | .749±.004 |
+
+- Corrected index at budget 4 (.743) ≥ uniform at budget 6 (.742), so the
+  **~33% fewer samples** claim holds. At budget 3, index moves from 1.4 points
+  below uniform (published) to 1.5 points above.
+- Re-running the original (buggy) serving rule locally reproduces the published
+  values within about 0.007; the residual is unexplained and may reflect cache
+  growth during the original sweep. Raw corrected numbers:
+  `examples/data/sweep_results_corrected.json` (the original
+  `sweep_results.json` and `sweep_plot.png` are left as published).
+- **Oracle headroom.** The oracle μ is estimated from the same samples it is
+  scored on (in-sample, >3× at budget 2). With μ estimated on one half of the
+  samples and scored on the other (200 splits, problem-clustered bootstrap), the
+  oracle gain at budget 2 is +4.2 points [2.0, 6.2], ≈2.5× sample efficiency
+  (95% CI 1.6× to >3×). Smoothing μ with a Jeffreys prior so that
+  0-observed problems are not abandoned gives ≈1.4×.
+- A 1-sample probe captures 69% of the held-out headroom at budget 3 (CI
+  31%–145%). Methods, scripts and raw outputs for these figures live in the
+  separate `rs-diagnostic` repo (v0.3 go/no-go diagnostic, 2026-10-19).
+
 ## Findings
 
 1. **The savings are real but signal-limited.** With the free probe signal
    (probe=2), index reaches 0.746 at budget 5 — better than uniform at budget 6
    (0.739). Roughly one sample/query (~17%) saved at the top of the curve, and
    probe=2 at budget 4 matches uniform at budget 5.
-2. **The headroom is large: a perfect difficulty signal is worth ~3×.** Oracle-μ
+2. **The headroom is large: a perfect difficulty signal is worth ~3× in-sample (~2.5× held-out, see Replay correction).** Oracle-μ
    allocation hits 0.739 at budget 2 (268 samples) — the accuracy uniform needs
    804 samples (budget 6) to reach. This is the strongest argument for the v0.2
    learned difficulty predictor: the allocator is not the bottleneck, the
@@ -79,7 +126,7 @@ work") found the batch-allocation idea published (training-free difficulty
 proxies; DSC) and the RL-side analogue done (Pilot-Commit), while labs move
 token allocation inside the model via effort controls. The findings here
 independently reproduce the field's consensus (middle-difficulty concentration,
-~3× oracle headroom, probe amortisation boundary) — the right call is to stop,
+~2.5× held-out oracle headroom, probe amortisation boundary) — the right call is to stop,
 not extend. Remaining roadmap items (learned difficulty predictor,
 token-denominated budgets, cross-query concurrency) are documented but
 intentionally not pursued; energy moves to the GRPO/post-training line.

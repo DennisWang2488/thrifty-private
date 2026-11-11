@@ -79,24 +79,37 @@ be re-derived with no API key at all. Full write-up: [`RESULTS.md`](RESULTS.md).
 
 | budget (avg samples/query) | 2 | 3 | 4 | 5 | 6 |
 |---|---|---|---|---|---|
-| uniform | .684±.011 | .710±.012 | .725±.006 | .731±.005 | .740±.003 |
-| index (probe=2) | .684±.011 | .696±.011 | **.737±.003** | **.745±.006** | .745±.006 |
-| index (oracle μ) | .742±.004 | .742±.004 | .742±.004 | .746±.005 | .749±.004 |
+| uniform | .682±.014 | .710±.012 | .725±.006 | .731±.005 | .742±.004 |
+| index (probe=2) | .682±.014 | .725±.006 | **.743±.004** | **.749±.004** | .749±.004 |
+| index (oracle μ, in-sample) | .749±.004 | .749±.004 | .749±.004 | .749±.004 | .749±.004 |
+
+> **Replay correction (2026-11).** The tables originally published here were
+> produced with a cache replay that re-served the probe samples during the
+> index top-up, so `index` was charged `probe + extra` samples but saw fewer
+> distinct ones. The table above is re-computed with a cursor-based replay
+> (`CachedBackend`, distinct samples per run). `uniform` is essentially
+> unchanged; `index` improves (budget 3: .696 → .725). Old and new numbers side
+> by side, and the 0.007 reproduction gap, are in
+> [`RESULTS.md`](RESULTS.md#replay-correction). The plot below predates the
+> correction.
 
 Two headlines:
 
-- **The free probe signal saves ~33% of samples.** Index at budget 4 (.737)
-  matches uniform at budget 6 (.740). The probe is free because its samples are
+- **The free probe signal saves ~33% of samples.** Index at budget 4 (.743)
+  matches uniform at budget 6 (.742). The probe is free because its samples are
   reused in the final answer, and with a verifier it estimates difficulty from
   the *unbiased* probe pass rate.
-- **A perfect difficulty signal would save 3×.** Oracle-μ allocation reaches
-  uniform's budget-6 accuracy at budget 2. The allocator is not the bottleneck —
-  the difficulty signal is. That gap is the case for a learned predictor.
+- **A perfect difficulty signal would save roughly 2.5×, not 3×.** The oracle
+  row above uses each problem's success rate estimated from the same cached
+  samples it is scored on, so it is optimistic (>3×). Estimated on held-out
+  halves, the oracle gain at budget 2 is +4.2 points, ≈2.5× sample efficiency
+  (95% CI 1.6× to >3×). The allocator is not the bottleneck — the difficulty
+  signal is — but a 1-sample probe already captures about 69% of the held-out
+  headroom at budget 3 (CI 31%–145%).
 
-Below budget 4 the probe's fixed cost isn't amortised and index degrades to (or
-slightly below) uniform; with `probe=4` and budget ≤ 4 the probe consumes the
-entire budget and index equals uniform *by construction*. Small probes win when
-budgets are small. `examples/demo_mock.py` reproduces the same qualitative
+At budget 2 the 2-sample probe consumes the entire budget, so index equals
+uniform *by construction*; likewise `probe=4` with budget ≤ 4. Small probes win
+when budgets are small. `examples/demo_mock.py` reproduces the same qualitative
 picture offline, for free.
 
 ## How it works (one paragraph)
@@ -143,7 +156,7 @@ paper-grade grading should swap in something like `math_verify`.
 ## Roadmap (not being pursued — see Project status)
 
 - **v0.3** learned difficulty predictor trained decision-focused (LANCER-style),
-  for the low-budget regime and non-verifiable tasks — the 3× oracle gap.
+  for the low-budget regime and non-verifiable tasks — the ~2.5× held-out oracle gap.
 - **v0.3** majority-vote production function (no verifier) — a different
   allocation law (`1 − (1−μ)^b` is the wrong objective there).
 - **v0.4** model routing (cheap/expensive) as part of the allocation;
@@ -182,8 +195,8 @@ in CI, and the results above are real and reproducible. But a 2026 literature
 scan (above) found the batch-allocation idea already published, the RL-side
 analogue already done, and labs absorbing token allocation into the models
 themselves. The findings here independently reproduce the field's consensus —
-concentrate on middle difficulty, ~3× headroom for a better difficulty signal,
-a probe-amortisation boundary at low budgets — which makes this a good artifact
+concentrate on middle difficulty, ~2.5× held-out headroom for a better difficulty signal,
+a probe-amortisation boundary at the lowest budget — which makes this a good artifact
 and a poor research bet. Extending it further would be motivated reasoning, so
 the roadmap above stays unbuilt. Issues and forks welcome if it is useful to
 you.

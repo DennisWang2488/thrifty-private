@@ -77,6 +77,7 @@ def main() -> None:
                 ),
             }
             for name, runner in runs.items():
+                backend.reset()  # independent run: serve from each prompt's first sample
                 res = runner.run(prompts, budget=budget)
                 acc = accuracy(res, gold, equal=math_equal)
                 results.setdefault(name, {}).setdefault(budget, []).append(acc)

@@ -57,9 +57,22 @@ def load_math500(data_dir: Path, levels: set[int]) -> list[dict]:
 
 
 class CachedBackend(LLMBackend):
-    """Disk-cached wrapper: serves the first ``n`` cached samples per prompt and
-    only hits the inner backend for the shortfall. Cache is append-only JSON,
-    one file per prompt hash."""
+    """Disk-cached wrapper around an inner backend.
+
+    Samples are served from a per-prompt cursor: successive ``sample(prompt, n)``
+    calls within one run return DISTINCT cached samples, in order, and only the
+    shortfall past the end of the cache hits the inner backend. This matters for
+    ``strategy="index"``, which calls ``sample`` twice per prompt (probe, then
+    top-up); the top-up must not re-serve the probe samples.
+
+    Call :meth:`reset` before each independent run (strategy, budget, rep) so
+    every run starts from the first sample again. The cache itself is append-only
+    JSON, one file per prompt hash.
+
+    Before this cursor existed, every call returned the first ``n`` samples, so
+    an index run was charged ``probe + extra`` samples but saw only
+    ``max(probe, extra)`` distinct ones (see RESULTS.md, "Replay correction").
+    """
 
     def __init__(
         self, inner: OpenAIBackend, cache_dir: Path, shuffle_seed: int | None = None
@@ -72,14 +85,19 @@ class CachedBackend(LLMBackend):
         # a seed permutes each prompt's cached samples before serving, so
         # repeated runs draw different (but still cached) subsets -> cheap reps
         self.shuffle_seed = shuffle_seed
+        self._pool: dict[str, list[str]] = {}  # prompt -> samples in serving order
+        self._cursor: dict[str, int] = {}  # prompt -> next unserved index
+
+    def reset(self) -> None:
+        """Start a new independent run: every prompt is served from its first sample."""
+        self._pool.clear()
+        self._cursor.clear()
 
     def _path(self, prompt: str) -> Path:
         h = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:24]
         return self.cache_dir / f"{h}.json"
 
-    def sample(self, prompt: str, n: int) -> list[str]:
-        if n <= 0:
-            return []
+    def _serving_order(self, prompt: str) -> list[str]:
         path = self._path(prompt)
         cached: list[str] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
         if self.shuffle_seed is not None and cached:
@@ -88,24 +106,32 @@ class CachedBackend(LLMBackend):
             rng = random.Random(f"{self.shuffle_seed}:{path.stem}")
             order = list(range(len(cached)))
             rng.shuffle(order)
-            served = [cached[i] for i in order]
-            if len(served) >= n:
-                self.calls += n
-                return served[:n]
-            # shortfall: generate fresh, append to the UNshuffled cache
-            new = self.inner.sample(prompt, n - len(served))
+            return [cached[i] for i in order]
+        return list(cached)
+
+    def sample(self, prompt: str, n: int) -> list[str]:
+        if n <= 0:
+            return []
+        # The serving order is fixed on first touch within a run: fresh samples
+        # appended to the disk cache must not reshuffle what was already served.
+        pool = self._pool.get(prompt)
+        if pool is None:
+            pool = self._pool[prompt] = self._serving_order(prompt)
+        k = self._cursor.get(prompt, 0)
+        out = pool[k : k + n]
+        if len(out) < n:
+            # shortfall: generate fresh, append to the UNshuffled on-disk cache
+            new = self.inner.sample(prompt, n - len(out))
             self.fresh += len(new)
+            path = self._path(prompt)
+            cached = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
             cached.extend(new)
             path.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
-            self.calls += n
-            return served + new
-        if len(cached) < n:
-            new = self.inner.sample(prompt, n - len(cached))
-            self.fresh += len(new)
-            cached.extend(new)
-            path.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
-        self.calls += n
-        return cached[:n]
+            pool.extend(new)
+            out = pool[k : k + n]
+        self._cursor[prompt] = k + len(out)
+        self.calls += len(out)
+        return out
 
 
 def read_key(args) -> str:
@@ -211,6 +237,7 @@ def main() -> None:
 
     for strat in args.strategies.split(","):
         strat = strat.strip()
+        backend.reset()  # each strategy is an independent run over the same cache
         runner = BudgetRunner(backend, strategy=strat, probe=args.probe, verifier=verifier)
         res = runner.run(prompts, budget=args.budget)
         acc = accuracy(res, gold, equal=math_equal)
